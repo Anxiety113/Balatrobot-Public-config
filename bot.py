@@ -304,10 +304,47 @@ def choose_discards(state, best_indices, best_name):
     return result if result else None
 
 
-def joker_priority(joker_key):
+JOKER_ECONOMY = {"j_business", "j_todo_list", "j_credit_card", "j_mail",
+    "j_cloud_9", "j_trading", "j_seed_money", "j_golden"}
+
+JOKER_SCALING = {"j_runner", "j_green_joker", "j_supernova", "j_ride_the_bus",
+    "j_fortune_teller", "j_steel_joker", "j_obelisk", "j_hologram",
+    "j_constellation", "j_cavendish", "j_graph", "j_card_sharp",
+    "j_ceremonial", "j_lucky_cat", "j_throwback", "j_baron",
+    "j_mystic_summit", "j_banner", "j_square", "j_fibonacci"}
+
+JOKER_FLAT_MULT = JOKER_MULT - JOKER_SCALING
+
+
+def joker_priority(joker_key, state=None):
+    ante = 0
+    has_mult = False
+    has_xmult = False
+    joker_keys = []
+    if state:
+        ante = state.get("ante_num", 0)
+        jokers = state.get("jokers", {}).get("cards", [])
+        joker_keys = [j.get("key", "") for j in jokers]
+        has_mult = any(k in JOKER_MULT for k in joker_keys)
+        has_xmult = any(k in JOKER_XMULT for k in joker_keys)
+
     if joker_key in JOKER_XMULT:
+        if has_mult:
+            return 5
+        if ante <= 2:
+            return 2
         return 3
-    if joker_key in JOKER_MULT:
+    if joker_key in JOKER_SCALING:
+        if ante <= 1:
+            return 3
+        return 4
+    if joker_key in JOKER_FLAT_MULT:
+        if ante <= 2 and not has_mult:
+            return 4
+        return 2
+    if joker_key in JOKER_ECONOMY:
+        if not has_mult and not has_xmult:
+            return 1
         return 2
     if joker_key in JOKER_UTILITY:
         return 1
@@ -459,6 +496,9 @@ def handle_shop(state):
     jokers = state.get("jokers", {}).get("cards", [])
     joker_count = state.get("jokers", {}).get("count", 0)
     joker_limit = state.get("jokers", {}).get("limit", 5)
+    ante = state.get("ante_num", 1)
+    interest_cap = 5
+    min_spend = max(4, money - interest_cap)
 
     if money < 4:
         return rpc("next_round")
@@ -479,20 +519,21 @@ def handle_shop(state):
                     lowest_idx = None
                     for j, jk in enumerate(jokers):
                         if not get_modifier(jk, "eternal", False):
-                            val = joker_priority(jk.get("key", ""))
-                    sell_val = get_cost(jk, "sell", 1)
-                    if lowest_val is None or val < lowest_val or (val == lowest_val and sell_val > get_cost(jk, "sell", 0)):
+                            val = joker_priority(jk.get("key", ""), state)
+                            sell_val = get_cost(jk, "sell", 1)
+                            if lowest_val is None or val < lowest_val or (val == lowest_val and sell_val > get_cost(jk, "sell", 0)):
                                 lowest_val = val
                                 lowest_idx = j
-                    if lowest_idx is not None and joker_priority(key) > lowest_val:
-                        if cost - get_cost(jokers[lowest_idx], "sell", 0) <= money:
+                    if lowest_idx is not None and joker_priority(key, state) > lowest_val:
+                        net_cost = cost - get_cost(jokers[lowest_idx], "sell", 0)
+                        if net_cost <= money:
                             rpc("sell", {"joker": lowest_idx})
                             money = state.get("money", 0)
                             joker_count -= 1
                     elif lowest_idx is None:
                         continue
-                if joker_count < joker_limit and cost <= money:
-                    pri = joker_priority(key)
+                if joker_count < joker_limit and cost <= min_spend:
+                    pri = joker_priority(key, state)
                     if has_joker_synergy(key, state):
                         pri += 1
                     if pri > best_priority or (pri == best_priority and cost < best_cost):
@@ -508,13 +549,13 @@ def handle_shop(state):
     if packs:
         for i, p in enumerate(packs):
             cost = get_cost(p, "buy", 0)
-            if cost <= money - 4:
+            if cost <= min_spend - 4:
                 key = p.get("key", "")
                 if "arcana" in key or "celestial" in key:
                     return rpc("buy", {"pack": i})
         for i, p in enumerate(packs):
             cost = get_cost(p, "buy", 0)
-            if cost <= money - 4:
+            if cost <= min_spend - 4:
                 return rpc("buy", {"pack": i})
 
     vouchers = shop.get("vouchers", {})
@@ -522,11 +563,21 @@ def handle_shop(state):
     if voucher_cards:
         for i, v in enumerate(voucher_cards):
             cost = get_cost(v, "buy", 0)
-            if cost <= money - 4:
+            if cost <= min_spend - 4:
                 return rpc("buy", {"voucher": i})
 
     reroll_cost = state.get("round", {}).get("reroll_cost", 5)
-    if money > reroll_cost + 8 and not shop_cards:
+    has_scaling = any(j.get("key", "") in JOKER_SCALING for j in jokers)
+    joker_keys = [j.get("key", "") for j in jokers]
+    no_mult = not any(k in JOKER_MULT for k in joker_keys)
+    no_xmult = not any(k in JOKER_XMULT for k in joker_keys)
+    if no_mult and money > reroll_cost + 4:
+        return rpc("reroll")
+    if no_xmult and money > reroll_cost + 8:
+        return rpc("reroll")
+    if not has_scaling and money > reroll_cost + 12:
+        return rpc("reroll")
+    if money > reroll_cost + 16:
         return rpc("reroll")
 
     return rpc("next_round")
@@ -595,7 +646,7 @@ def handle_sell_jokers(state):
     for i, j in enumerate(jokers):
         if get_modifier(j, "rental", False):
             key = j.get("key", "")
-            if joker_priority(key) < 2:
+            if joker_priority(key, state) < 2:
                 return rpc("sell", {"joker": i})
     return None
 
