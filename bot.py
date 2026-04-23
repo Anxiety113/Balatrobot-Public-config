@@ -14,6 +14,7 @@ URL = "http://127.0.0.1:12346"
 DECK = "RED"
 STAKE = "WHITE"
 SEED = None
+DESIRED_RUNS = 0
 
 RANK_ORDER = {
     "2": 2, "3": 3, "4": 4, "5": 5, "6": 6, "7": 7,
@@ -632,7 +633,20 @@ def play_game():
     if SEED:
         params["seed"] = SEED
     state = rpc("start", params)
-    print(f"Started run: deck={DECK}, stake={STAKE}, seed={state.get('seed', '???')}")
+    seed = state.get("seed", "???")
+    print(f"Started run: deck={DECK}, stake={STAKE}, seed={seed}")
+
+    run_log = {
+        "seed": seed,
+        "deck": DECK,
+        "stake": STAKE,
+        "won": False,
+        "ante": 0,
+        "round": 0,
+        "jokers": [],
+        "hands_played": Counter(),
+        "loss_reason": None,
+    }
 
     while state.get("state") != "GAME_OVER":
         game_state = state.get("state", "")
@@ -645,8 +659,10 @@ def play_game():
                 rearranged = handle_rearrange_jokers(state)
                 if rearranged is not None:
                     state = rearranged
-                    if state.get("state") != "SELECTING_HAND":
-                        continue
+                if state.get("state") != "SELECTING_HAND":
+                    continue
+                best_indices, best_name, best_score = find_best_hand(state)
+                run_log["hands_played"][best_name] += 1
                 state = handle_selecting_hand(state)
 
             case "ROUND_EVAL":
@@ -654,6 +670,8 @@ def play_game():
 
             case "SHOP":
                 handle_sell_jokers(state)
+                jokers = state.get("jokers", {}).get("cards", [])
+                run_log["jokers"] = [j.get("key", "?") for j in jokers]
                 state = handle_shop(state)
 
             case "SMODS_BOOSTER_OPENED":
@@ -662,13 +680,125 @@ def play_game():
             case _:
                 state = rpc("gamestate")
 
-    if state.get("won"):
-        print(f"Victory! Final ante: {state.get('ante_num')}")
-    else:
-        print(f"Game over at ante {state.get('ante_num')}, round {state.get('round_num')}")
+        run_log["ante"] = state.get("ante_num", run_log["ante"])
+        run_log["round"] = state.get("round_num", run_log["round"])
 
-    return state.get("won", False)
+    won = state.get("won", False)
+    run_log["won"] = won
+    if won:
+        print(f"Victory! Final ante: {run_log['ante']}")
+    else:
+        print(f"Game over at ante {run_log['ante']}, round {run_log['round']}")
+        if run_log["ante"] <= 1:
+            run_log["loss_reason"] = "early_ante"
+        elif run_log["ante"] <= 3:
+            run_log["loss_reason"] = "mid_ante"
+        elif run_log["ante"] <= 5:
+            run_log["loss_reason"] = "late_ante"
+        else:
+            run_log["loss_reason"] = "endgame"
+
+    return run_log
+
+
+def generate_report(run_logs, run_num):
+    total = len(run_logs)
+    wins = sum(1 for r in run_logs if r["won"])
+    losses = total - wins
+    win_rate = (wins / total * 100) if total > 0 else 0
+
+    ante_deaths = Counter()
+    for r in run_logs:
+        if not r["won"]:
+            ante_deaths[r["ante"]] += 1
+
+    loss_reasons = Counter(r["loss_reason"] for r in run_logs if r["loss_reason"])
+    all_hands = Counter()
+    for r in run_logs:
+        all_hands.update(r["hands_played"])
+
+    joker_counts = Counter()
+    for r in run_logs:
+        for j in r["jokers"]:
+            joker_counts[j] += 1
+
+    print(f"\n{'='*60}")
+    print(f"  RUN REPORT  (after {run_num} runs)")
+    print(f"{'='*60}")
+    print(f"  Total: {total}  |  Wins: {wins}  |  Losses: {losses}  |  Win Rate: {win_rate:.1f}%")
+    if ante_deaths:
+        print(f"\n  Deaths by Ante:")
+        for ante in sorted(ante_deaths):
+            label = f"Ante {ante}" if ante > 0 else "Unknown"
+            print(f"    {label}: {ante_deaths[ante]}")
+    if loss_reasons:
+        print(f"\n  Loss Categories:")
+        for reason, count in loss_reasons.most_common():
+            label = reason.replace("_", " ").title()
+            print(f"    {label}: {count}")
+    if all_hands:
+        print(f"\n  Hands Played (most common):")
+        for hand, count in all_hands.most_common(5):
+            print(f"    {hand}: {count}")
+    if joker_counts:
+        print(f"\n  Most Used Jokers:")
+        for joker, count in joker_counts.most_common(5):
+            print(f"    {joker}: {count}")
+
+    suggestions = []
+    if win_rate < 20:
+        suggestions.append("Win rate is very low. Consider switching to a stronger deck (PLASMA/BLUE).")
+    if win_rate < 50 and "early_ante" in loss_reasons:
+        suggestions.append("Frequent early deaths. Prioritize buying +Mult jokers early to survive Ante 1-2.")
+    if "mid_ante" in loss_reasons:
+        suggestions.append("Dying in mid-antes. Look for X-Mult jokers (Cavendish, Hologram, Baron) and economy.")
+    if "late_ante" in loss_reasons:
+        suggestions.append("Struggling in late-antes. Need better scaling: Obelisk, Steel Joker, Constellation.")
+    if "endgame" in loss_reasons:
+        suggestions.append("Close to winning! Focus on glass cards, Red Seal, and X-Mult stacking for Ante 8.")
+    top_hand = all_hands.most_common(1)
+    if top_hand and top_hand[0][0] in ("High Card", "Pair"):
+        suggestions.append("Relying on weak hands. Try to build toward Flush/Full House with suit converters.")
+    xmunt_count = sum(count for j, count in joker_counts.items() if j in JOKER_XMULT)
+    mult_count = sum(count for j, count in joker_counts.items() if j in JOKER_MULT)
+    if mult_count > xmunt_count * 3 and mult_count > 5:
+        suggestions.append("Lots of +Mult jokers but few X-Mult. Adding X-Mult dramatically increases score.")
+
+    if suggestions:
+        print(f"\n  Suggested Optimizations:")
+        for i, s in enumerate(suggestions, 1):
+            print(f"    {i}. {s}")
+    print(f"{'='*60}\n")
+
+
+def main():
+    if DESIRED_RUNS == 0:
+        print(f"DESIRED_RUNS=0: Running infinitely. Press Ctrl+C to stop and get report.")
+    else:
+        print(f"Running {DESIRED_RUNS} run(s)...")
+
+    run_logs = []
+    run_count = 0
+
+    try:
+        while True:
+            run_count += 1
+            print(f"\n--- Run {run_count}{'/' + str(DESIRED_RUNS) if DESIRED_RUNS else ''} ---")
+            result = play_game()
+            run_logs.append(result)
+
+            if DESIRED_RUNS > 0 and run_count >= DESIRED_RUNS:
+                break
+
+            if run_count % 5 == 0:
+                generate_report(run_logs, run_count)
+
+    except KeyboardInterrupt:
+        print(f"\n\nStopped by user after {run_count} runs.")
+
+    if run_logs:
+        generate_report(run_logs, run_count)
 
 
 if __name__ == "__main__":
-    play_game()
+    main()
